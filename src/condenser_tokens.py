@@ -6,12 +6,21 @@ import random
 
 
 
+# This worked!!!!!
+# C_MAG = {
+#         'c_high': (0.2,'<C_HIGH>'),# Testing at full throttle to start. dont confuse model with multiple goals.
+     
+#     }
+
+C_CONTINOUS_SCALE_LOSS_FACTOR = 0.01 #uSE TO ENSURE loss is balanced with reconstruction loss 
 
 C_MAG = {
-        'c_high': (0.20,'<C_HIGH>'),# Testing at full throttle to start. dont confuse model with multiple goals.
-        #'c_med': (0.2,'<C_MED>'),
-        #'c_low': (0.5,'<C_LOW>'),
-        #'c_repeat': (1.0,'<C_REP>'),
+        # 'c_high': (0.05,'<C_HIGH>'),# Testing at full throttle to start. dont confuse model with multiple goals.
+        'c_med': (0.2,'<C_MED>'),
+        # 'c_low': (0.5,'<C_LOW>'),
+        # 'c_repeat': (1.0,'<C_REP>'),
+        # 'c_cont': (0.01,'<C_CONT>'), # Much less pressure on the eos loss here. To try and get a dynamic loss...
+
     }
 
 MAG_VAL_IDX = 0
@@ -72,15 +81,16 @@ class CondenserTokenizer(torch.nn.Module):
         c_text = [self.tokens['c_BOS'] + self.magnetude[r][MAG_TOKEN_IDS] + s + self.tokens['c_EOS'] for (s,r) in zip(text,rate)] #
         return c_text,rate
     
-    def extract_embeddings(self,tokens,embedding_table):
+    def extract_embeddings(self,tokens,embedding_table,insert_replacement_embs = True):
         """
         generate embeddings from a token list and replace ctoken embeddings with internal
         representations. We are doing this because PEFT models will not optimize embeddings...
         for some unknown reason.
         """
         emb = embedding_table(tokens) 
-        for k in self.tok_idx_lookup.keys():
-            emb[tokens == k] = self.embed[k - self.len_o].half()
+        if insert_replacement_embs:
+            for k in self.tok_idx_lookup.keys():
+                emb[tokens == k] = self.embed[k - self.len_o].half()
         return emb
 
     def get_token_shift(self):
@@ -90,6 +100,17 @@ class CondenserTokenizer(torch.nn.Module):
         vals = [self.magnetude[m][MAG_VAL_IDX] for m in mags]
         res = torch.tensor(vals,device = device).unsqueeze(-1)
         return res
+
+
+    def get_scale_tensor(self,mags,device = 'auto'):
+        vals = [self.magnetude[m][MAG_TOKEN_IDS] == '<C_CONT>' for m in mags]
+        res = C_CONTINOUS_SCALE_LOSS_FACTOR*torch.tensor(vals,device = device,dtype = torch.float).unsqueeze(-1)
+        res = res + torch.tensor([not v for v in vals],device = device,dtype = torch.float).unsqueeze(-1)
+        # print(res)
+        # print(vals)
+        # print([not v for v in vals])
+
+        return res        
     
     def get_dummy():
         return

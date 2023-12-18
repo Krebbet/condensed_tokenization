@@ -93,9 +93,9 @@ def main():
     overfit = False
     size = 32000
     checkpoint_step = 500
-    lr = 1.0e-5
+    lr = 1.0e-4
     #OUTPUT_DIR = '../models/w_encoder/lr1e-5_L2_2L256_Adam_fudge0.03_25' # try 1024
-    OUTPUT_DIR = '../models/w_encoder/lr1e-5_L2_2L1024_L2_fudge0.03_28'
+    OUTPUT_DIR = '../models/w_encoder/new_lr1e-4_L2_2L1024_L2_fudge0.03_01'
     
     
     # load last checkpoint if exists
@@ -122,8 +122,8 @@ def main():
     # param['model'] = w_encoder.parameters()
     # optimizer = torch.optim.SGD([w_encoder.parameters()] + param, lr=lr)
 
-    params = [{'params': l.parameters(), 'lr': lr, 'weight_decay': 0}  for l in w_encoder.layers]
-    params += [{'params': w_encoder.parameters(), 'lr': lr, 'weight_decay': 0} ]
+    #params = [{'params': l.parameters(), 'lr': lr, 'weight_decay': 0}  for l in w_encoder.layers]
+    params = [{'params': w_encoder.parameters(), 'lr': lr, 'weight_decay': 0} ]
     #optimizer = torch.optim.Adam(params)
     optimizer = torch.optim.AdamW(params)
 

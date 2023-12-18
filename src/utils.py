@@ -29,6 +29,17 @@ import pickle
 
 from loss import compute_loss,compute_length_penalty,length_penalty_by_eos
 
+
+
+# CONSTS and DEFAULTS
+SAVE_STATE_PATH = "acc/checkpoint_interim"
+SAVE_STATE_META_PATH = 'acc/progress_meta.pkl'
+SAVE_STATE_CTOKENIZER_PATH = 'acc/ctokenizer.pkl'
+SAVE_ENCODER_PATH = "acc/checkpoint_interim/encoder_checkpoint"
+
+
+
+
 access_token = "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"
 #device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -58,6 +69,21 @@ def load_data():
     with open("../data/validation_01.pkl", "rb") as input_file:
         val = pickle.load(input_file)
 
+
+    train_ds = []
+    #training_files = ['orcha_02_0.pkl','train_01.pkl','orcha_01.pkl']
+    #training_files = ['orca_02_shard0_max200.pkl','train_01.pkl','orca_01_shard0_max200.pkl']
+    #training_files = ['orca_02_shard0_max150.pkl','train_01.pkl','orca_01_shard0_max150.pkl']
+    training_files = ['orca_02_shard0_max100.pkl','train_01.pkl','orca_01_shard0_max100.pkl']
+    for f in training_files:
+        path = f"../data/{f}"
+        print(path)
+        with open(path, "rb") as input_file:
+            train = pickle.load(input_file)
+        train_ds.append(Dataset.from_dict(train))
+
+
+
     with open("../data/train_01.pkl", "rb") as input_file:
         train = pickle.load(input_file)
 
@@ -65,7 +91,7 @@ def load_data():
         test = pickle.load(input_file)
 
     return DatasetDict({
-        "train":Dataset.from_dict(train),
+        "train":train_ds,
         "test":Dataset.from_dict(test),
         "val":Dataset.from_dict(val),
         })
@@ -88,6 +114,44 @@ def print_summary(result):
 
 
 
+
+def nonuniform_lists_to_tensor(data, max_len = 50, pad_token = 0):
+    data = [torch.nn.functional.pad(x, pad=(pad_token, max_len - x.numel()), mode='constant', value=0) for x in data]
+    data = torch.stack(data)
+    return data
+
+
+def tokenize_and_exclude(x,tokenizer,max_length,padding,truncation,exclude_token = 29871,max_buffer = 5):
+    """
+    simple inefficient way to strip out the additional tokens added by tokenizer.
+    (Should encorporate into class and make more efficient.
+    """
+    x = tokenizer(x,
+                add_special_tokens = False,# No special tokens for output.
+                truncation = truncation,
+                padding=padding,
+                max_length = max_length+max_buffer,
+                    )
+
+    new_tokens = []
+    new_att_mask = []
+    for t,a in zip(x['input_ids'],x['attention_mask']):
+        tmp_t = []
+        tmp_a = []
+        for i in range(len(t)):
+            if t[i] != 29871:
+                tmp_t.append(t[i])
+                tmp_a.append(a[i])
+        new_tokens.append(torch.tensor(tmp_t))
+        new_att_mask.append(torch.tensor(tmp_a))
+
+    # turn into tensors
+    tokens = nonuniform_lists_to_tensor(new_tokens)
+    att_mask = nonuniform_lists_to_tensor(new_att_mask)
+    return tokens,att_mask
+
+
+
 def prepare_data(batch,tokenizer,ctokenizer,device, max_answer_token_size = 100):
     """
     Set max_answer_token_size to -1 if you want no limit.
@@ -105,20 +169,23 @@ def prepare_data(batch,tokenizer,ctokenizer,device, max_answer_token_size = 100)
 
     inputs = ctokenizer(batch['questions'])
     max_lengths = torch.sum(inputs['attention_mask'],dim=1) - 1  - ctokenizer.get_token_shift()# -1 is to subtract the <s> token
-    outputs = tokenizer(batch['answers'],
-                    return_tensors='pt', 
-                    add_special_tokens = False,# No special tokens for output.
-                    truncation = truncation,
-                    padding=padding,
-                    max_length = max_length,
-                    ) 
+    y, y_att = tokenize_and_exclude(batch['answers'],tokenizer,max_length,padding,truncation)
+    
+    ### Adds unwanted tokens when /n is inserted... needed to replace.    
+    # outputs = tokenizer(batch['answers'],
+    #                 return_tensors='pt', 
+    #                 add_special_tokens = False,# No special tokens for output.
+    #                 truncation = truncation,
+    #                 padding=padding,
+    #                 max_length = max_length,
+    #                 ) 
 
     return {
-        'x':inputs['input_ids'],
-        'y':outputs['input_ids'],
-        'x_att':inputs["attention_mask"],
-        'y_att':outputs["attention_mask"],
-        'x_max_lengths':max_lengths,
+        'x':inputs['input_ids'].to(device),
+        'y':y.to(device),
+        'x_att':inputs["attention_mask"].to(device),
+        'y_att':y_att.to(device),
+        'x_max_lengths':max_lengths.to(device),
         "condenser_mags":inputs['mags'],
     }
 
@@ -135,7 +202,7 @@ def batch_text_to_emb(text,model,tokenizer):
 
 def add_start_token_embedding(x,att,embedding_table,start_token = 1,device = 'cuda'):
     # add start embs
-    s_emb = embedding_table(torch.tensor([1],device = device)).unsqueeze(0)
+    s_emb = embedding_table(torch.tensor([start_token],device = device)).unsqueeze(0)
     s_emb = torch.tile(s_emb,dims = (x.shape[0],1,1))
     x = torch.concat([s_emb,x],dim = 1)
     # add start att.
@@ -143,11 +210,47 @@ def add_start_token_embedding(x,att,embedding_table,start_token = 1,device = 'cu
     att = torch.concat([s_att,att],dim = 1)
     return x,att
 
+# def batch_inference():
+#     batch = prepare_data(batch,tokenizer,ctokenizer,device,max_answer_token_size = max_answer_token_size)
+
+#     x_enc =  ctokenizer.extract_embeddings(x,encoder_model.base_model.get_input_embeddings())
+#     x_emb,x_emb_att = run_encoding_generation(x_enc,x_att,
+#                                             encoder_model,
+#                                             max_lengths,
+#                                             device,generation_config = model.generation_config,
+#                                             gen_length_shift = ctokenizer.get_token_shift(),
+#                                             insert_rand_eos = insert_rand_eos
+#                                             )
+    
+
+#     bos_tensor = model.generation_config.bos_token_id*torch.ones([x.shape[0],1],dtype = torch.int)
+#     bos_emb = model.get_input_embeddings()(bos_tensor)
+#     bos_att = torch.ones([x.shape[0],1],dtype = torch.int)
+
+
+#     # generate new answer
+#     y = model.generate(x_tokens.to(device), # Needs to be tokens
+#                    attention_mask = x_mask.to(device),
+#                 output_hidden_states = False,
+#                 return_dict_in_generate = True,
+#                 max_length =400,
+#                        num_beams = 1,
+#                        do_sample = False,
+#                        #temperature = None,
+#             )
+#     # process new answer
+#     y_tokens = y.sequences[:,x_tokens.shape[1]:]
+#     new_answer = tokenizer.batch_decode(y_tokens,skip_special_tokens=True)
+
 
 #@torch.autocast(device_type="cuda")
-def training_step(x,y,x_att,y_att,max_lengths,mags, #I/O
-                  model,encoder_model,embedding_table,ctokenizer, # Models
-                  ignore_tokens,device,generation_max=1000,insert_rand_eos = True): # other
+def training_step(x,y,x_att,y_att,max_lengths,mags,loss_scale, #I/O
+                  model,encoder_model,ctokenizer, # Models
+                  device,generation_max=1000,
+                  insert_rand_eos = True,
+                  add_y_bos= False,
+                  use_ctokenizer = True,
+                  ): # other
     '''
     The goal of the optimization process is to generate condensed embeddings, equivalent 
     model embedding representations that take up less token space from the encoding model. 
@@ -183,6 +286,7 @@ def training_step(x,y,x_att,y_att,max_lengths,mags, #I/O
     
     #Preamble. Grab any nec. values
     max_x_length = x.shape[1] # m
+    embedding_table = encoder_model.base_model.get_input_embeddings() 
 
     # print('CHECK EMB')
     # print(embedding_table(torch.tensor([32001])))
@@ -191,12 +295,14 @@ def training_step(x,y,x_att,y_att,max_lengths,mags, #I/O
 
 
     # GENERATE CONDENSED EMBEDDINGS USING THE ENCODER MODEL AND THE INPUT TOKENS!
+    
     with torch.no_grad():
-        x_enc =  ctokenizer.extract_embeddings(x,embedding_table)
+        #x_enc =  ctokenizer.extract_embeddings(x,encoder_model.base_model.get_input_embeddings().modules_to_save.default)
+        x_enc =  ctokenizer.extract_embeddings(x,embedding_table,insert_replacement_embs = use_ctokenizer)
         x_emb,x_emb_att = run_encoding_generation(x_enc,x_att,
                                                   encoder_model,
                                                   max_lengths,
-                                                  device,generation_config = model.generation_config,
+                                                  device,generation_config = encoder_model.base_model.config,
                                                   gen_length_shift = ctokenizer.get_token_shift(),
                                                   insert_rand_eos = insert_rand_eos
                                                   )
@@ -204,18 +310,25 @@ def training_step(x,y,x_att,y_att,max_lengths,mags, #I/O
 
     
     # RUN x_EMB through encoder to get gradients!!!!
-    x_emb,x_emb_att = add_start_token_embedding(x_emb,x_emb_att,embedding_table,device = device)    
+    x_emb,x_emb_att = add_start_token_embedding(x_emb,x_emb_att,embedding_table,start_token = encoder_model.base_model.config.bos_token_id,device = device)    
     x_emb,x_emb_att,length_logits = encoder_model.process_training_embedding(x_emb.half(),x_emb_att,device =device)
 
     #### PROCESS THE GENERATED EMBEDDING WITH THE DESIRED OUTCOME
-    y_emb = embedding_table(y) #grab the word embeddings for y
+    # FIX: is this why I am getting NAN's? Try using model embedding table for this.
+    y_emb = model.get_input_embeddings()(y) #grab the word embeddings for y
     # prepend x emb with BOS token
     bos_tensor = model.generation_config.bos_token_id*torch.ones([x.shape[0],1],dtype = torch.int)
-    bos_emb = embedding_table(bos_tensor)
+    bos_emb = model.get_input_embeddings()(bos_tensor)
     bos_att = torch.ones([x.shape[0],1],dtype = torch.int)
     # concat inputs.
-    xy_input = torch.concatenate([bos_emb.to(device),x_emb.to(device),y_emb.to(device)],dim=1) # put together our desired outcome string for model processing
-    xy_att = torch.concatenate([bos_att.to(device),x_emb_att.to(device),y_att.to(device)],dim=1) # same for attention mask.    out = encoder_model(inputs_embeds = xy_input,attention_mask = xy_att) # process outcomes.
+    if add_y_bos:
+        xy_input = torch.concatenate([bos_emb.to(device),x_emb.to(device),bos_emb.to(device),y_emb.to(device)],dim=1) # put together our desired outcome string for model processing
+        xy_att = torch.concatenate([bos_att.to(device),x_emb_att.to(device),bos_att.to(device),y_att.to(device)],dim=1) # same for attention mask.    out = encoder_model(inputs_embeds = xy_input,attention_mask = xy_att) # process outcomes.
+        bos_shift = 1
+    else:
+        xy_input = torch.concatenate([bos_emb.to(device),x_emb.to(device),y_emb.to(device)],dim=1) # put together our desired outcome string for model processing
+        xy_att = torch.concatenate([bos_att.to(device),x_emb_att.to(device),y_att.to(device)],dim=1) # same for attention mask.    out = encoder_model(inputs_embeds = xy_input,attention_mask = xy_att) # process outcomes.
+        bos_shift = 0
 
 
     # RUN MODEL - We want these to come from the OG model. This is where the inputs should finally go!!!
@@ -226,7 +339,7 @@ def training_step(x,y,x_att,y_att,max_lengths,mags, #I/O
     # Model predicts at token +1 so first token (BOS) has nothing, but is not included in max length SO
     # correct window is [max length,-1] : Which is the start of the Y string logits to the end of the Y string
     # we ignore the final token because it is the next token which we have no label for.
-    logits = out.loss['logits'][:,max_x_length:-1] 
+    logits = out.loss['logits'][:,max_x_length+bos_shift:-1] 
     labels = y.to(device)
 
     # Flatten
@@ -245,8 +358,16 @@ def training_step(x,y,x_att,y_att,max_lengths,mags, #I/O
         x_emb_att,
         max_lengths,
         mags,
-        model.generation_config
+        loss_scale,
+        encoder_model.base_model.config,
         )
+    
+    # print('XY *********')
+    # print(xy_input)
+    # print('LOGITS *********')
+    # print(logits)
+
+    #print(recon_loss,length_loss)
     
 
 
@@ -284,6 +405,7 @@ def length_to_mask(length, device, max_len=None, dtype=None):
     if dtype is not None:
         mask = torch.as_tensor(mask, dtype=dtype, device=length.device)
     return mask
+
 
 
 #@torch.autocast(device_type="cuda")
@@ -341,7 +463,7 @@ def run_encoding_generation(
         #     print(p.dtype)
             
         # Generate outputs and extract embeddings for next token
-        next_embedding, outputs = model(input_embeddings,input_att,device = device) # Run model using embeddings NOT tokens.
+        encoder_embedding,next_embedding, outputs = model(input_embeddings,input_att,device = device) # Run model using embeddings NOT tokens.
         #next_embedding = outputs.hidden_states[-1][:,-1,:].to(device) # Last embedding layer, last token.
         #next_embedding = w_encoder(next_embedding.float()).half()
         #next_embedding = F.normalize(next_embedding)
@@ -353,6 +475,7 @@ def run_encoding_generation(
         next_token = torch.argmax(next_token_logits, dim=-1).to(device) # Simple greedy pred.
 
         ### Insert random EOS to encourage early stopping
+        # Depricated.
         if insert_rand_eos:
             cond = torch.rand([batch_size]) < rand_eos_freq
             next_token[cond] = generation_config.eos_token_id
@@ -364,7 +487,10 @@ def run_encoding_generation(
         unfinished_sequences = unfinished_sequences.mul(
                      next_token.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
                  )
-        #print(unfinished_sequences)
+        
+        # if torch.sum(unfinished_sequences) < 4:
+        #     print("EOS predicted")
+        #     print(i,unfinished_sequences,next_token)
 
 
         # mask out already finished sequences.
@@ -372,13 +498,24 @@ def run_encoding_generation(
         stop_mask = (unfinished_sequences*max_length_mask[:,i]).to(device) # gives [0,1] mask for embedding at position X. (Can we just apply at end?)
         next_token = next_token * stop_mask + generation_config.pad_token_id * (1 - stop_mask) # If over max length, pad the encoding.
 
+
+        # if torch.sum(unfinished_sequences) < 4:
+        #     print(stop_mask)
+        #     print(next_token)
+            #print(unfinished_sequences)
+
+
+
+
         # tag eos tokens to finish sequence generation.
-        unfinished_sequences = unfinished_sequences.mul(
-                     next_token.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
-                 )
+        # unfinished_sequences = unfinished_sequences.mul(
+        #              next_token.tile(eos_token_id_tensor.shape[0], 1).ne(eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
+        #          )
 
 
         ### Insert results into holder tensorts
+        #generated_embeddings[:,i,:] = next_embedding*stop_mask.unsqueeze(-1)    
+        #print(generated_embeddings.shape,next_embedding.shape)    
         generated_embeddings[:,i,:] = next_embedding*stop_mask.unsqueeze(-1)        
         generated_tokens[:,i] = next_token
         gen_stop[:,i] = stop_mask
